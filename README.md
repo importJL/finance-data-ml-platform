@@ -134,9 +134,7 @@ Models are cached in memory during the session and can be saved to `models/` for
 ├── models/                   # Saved model files (created on first training)
 ├── .env.example              # Template for API key config
 ├── .gitignore
-├── requirements.txt
-├── AGENTS.md                 # Architecture specification
-└── ML_PLAN.md                # Phase 2 ML expansion plan
+└── requirements.txt
 ```
 
 ## License
