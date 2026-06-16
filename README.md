@@ -1,6 +1,6 @@
-# Alpha Vantage ETL Pipeline + ML Analysis
+# Alpha Vantage & Polygon ETL Pipeline + ML Analysis
 
-A Streamlit-based GUI that extracts financial market data via the [Alpha Vantage API](https://www.alphavantage.co/), transforms it into structured formats, and runs on-demand machine learning models for volatility prediction, earnings momentum analysis, and macro regime classification.
+A Streamlit-based GUI that extracts financial market data via the [Alpha Vantage API](https://www.alphavantage.co/) and [Polygon API](https://massive.com/docs/rest/quickstart), transforms it into structured formats, and runs on-demand machine learning models for volatility prediction, earnings momentum analysis, and macro regime classification.
 
 **Phase 1:** Single-endpoint ETL (fetch, transform, display, download).
 **Phase 2:** Multi-endpoint ML pipeline with Point-in-Time Feature Store, sentiment analysis, earnings estimates, macro indicators, and three trained models.
@@ -9,6 +9,7 @@ A Streamlit-based GUI that extracts financial market data via the [Alpha Vantage
 
 - **Python 3.10+**
 - **Alpha Vantage API key** — free tier available at [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key)
+- **Polygon API key** - free tier available upon sign-up from pricing page [massive.com/pricing](https://massive.com/pricing)
 
 ## Setup
 
@@ -27,7 +28,7 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Create a `.env` file in the project root with your Alpha Vantage API key:
+Create a `.env` file in the project root with your Alpha Vantage and Polygon API key:
 
 ```bash
 cp .env.example .env
@@ -37,6 +38,7 @@ Edit `.env` and replace the placeholder:
 
 ```
 ALPHAVANTAGE_API_KEY=your_actual_api_key_here
+POLYGON_API_KEY=your_polygon_api_key_here
 ```
 
 The app will raise a clear error at startup if the key is missing.
@@ -102,7 +104,7 @@ Select an **Analysis Module** from the sidebar dropdown for multi-endpoint ML an
 
 ## Rate Limits
 
-Alpha Vantage's free tier allows **5 API calls per minute** and **500 per day**. The app enforces this with:
+Alpha Vantage's free tier allows **5 API calls per minute** and **500 per day**, while Polygon's free tier allows the same rate-limits but with **no upper bound** to the number of daily calls. The app enforces this with:
 - A sliding-window rate limiter (auto-pauses if 5 calls in 60 seconds is reached)
 - A daily call counter (tracked in session state, resets daily)
 - A budget warning in the GUI when an analysis module requires more calls than remaining
