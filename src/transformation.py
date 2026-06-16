@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 
 
@@ -37,6 +39,8 @@ class TransformationAgent:
             return self._transform_news_sentiment(data)
         elif ep == "EARNINGS_ESTIMATES":
             return self._transform_earnings_estimates(data)
+        elif ep == "TREASURY_YIELDS":
+            return self._transform_polygon_treasury_yields(data)
         elif ep.startswith("TREASURY_YIELD"):
             return self._transform_treasury_yield(data, ep)
         elif ep == "GOLD_SILVER_HISTORY":
@@ -45,8 +49,16 @@ class TransformationAgent:
             return self._transform_gold_silver_spot(data)
         elif ep == "CURRENCY_EXCHANGE_RATE":
             return self._transform_currency_exchange(data)
+        elif ep == "OPEN_CLOSE":
+            return self._transform_polygon_open_close(data)
+        elif ep == "NEWS":
+            return self._transform_polygon_news(data)
+        elif ep == "FX_GROUPED":
+            return self._transform_polygon_fx(data)
         else:
             return {"error": f"Unknown endpoint: {endpoint}"}
+
+    # ── Alpha Vantage transformers (existing) ──────────────────
 
     def _transform_time_series_daily(self, data):
         series = data.get("Time Series (Daily)")
@@ -167,17 +179,25 @@ class TransformationAgent:
     def _transform_earnings_estimates(self, data):
         estimates = data.get("estimates", [])
         if not estimates:
+            estimates = data.get("annualEarningsEstimate", []) + data.get("quarterlyEarningsEstimate", [])
+
+        if not estimates:
             return {"error": "No earnings estimates found."}
 
         records = []
         for est in estimates:
+            date_val = est.get("date") or est.get("fiscalDateEnding", "")
+            horizon = est.get("horizon", "fiscal year" if est.get("fiscalDateEnding") else "")
+            eps_avg = _safe_float(est.get("eps_estimate_average") or est.get("estimatedEPS"))
+            eps_high = _safe_float(est.get("eps_estimate_high"))
+            eps_low = _safe_float(est.get("eps_estimate_low"))
             records.append({
-                "Date": est.get("date", ""),
-                "horizon": est.get("horizon", ""),
-                "eps_estimate_average": _safe_float(est.get("eps_estimate_average")),
-                "eps_estimate_high": _safe_float(est.get("eps_estimate_high")),
-                "eps_estimate_low": _safe_float(est.get("eps_estimate_low")),
-                "eps_estimate_analyst_count": _safe_int(est.get("eps_estimate_analyst_count")),
+                "Date": date_val,
+                "horizon": horizon,
+                "eps_estimate_average": eps_avg,
+                "eps_estimate_high": eps_high,
+                "eps_estimate_low": eps_low,
+                "eps_estimate_analyst_count": _safe_int(est.get("eps_estimate_analyst_count") or est.get("numberOfEstimates")),
                 "eps_estimate_average_7_days_ago": _safe_float(est.get("eps_estimate_average_7_days_ago")),
                 "eps_estimate_average_30_days_ago": _safe_float(est.get("eps_estimate_average_30_days_ago")),
                 "eps_estimate_revision_up_7d": _safe_int(est.get("eps_estimate_revision_up_trailing_7_days")),
@@ -242,12 +262,15 @@ class TransformationAgent:
         parsed = []
         for item in records:
             if isinstance(item, dict):
+                date_str = item.get("date", item.get("Date", ""))
+                value = _safe_float(item.get("value", item.get("Value")))
+                close = _safe_float(item.get("close", item.get("Close")))
                 parsed.append({
-                    "Date": item.get("date", item.get("Date", "")),
-                    "Open": _safe_float(item.get("open", item.get("Open"))),
-                    "High": _safe_float(item.get("high", item.get("High"))),
-                    "Low": _safe_float(item.get("low", item.get("Low"))),
-                    "Close": _safe_float(item.get("close", item.get("Close"))),
+                    "Date": date_str,
+                    "Open": _safe_float(item.get("open", item.get("Open"))) or value,
+                    "High": _safe_float(item.get("high", item.get("High"))) or value,
+                    "Low": _safe_float(item.get("low", item.get("Low"))) or value,
+                    "Close": close if close is not None else value,
                     "Volume": _safe_float(item.get("volume", item.get("Volume"))),
                 })
 
@@ -274,7 +297,193 @@ class TransformationAgent:
     def _transform_currency_exchange(self, data):
         if not data or data == {}:
             return {"error": "Empty response from API"}
-        df = _make_single_row_df(data)
+
+        inner = data.get("Realtime Currency Exchange Rate", data)
+        if not isinstance(inner, dict):
+            return {"error": "Unexpected currency exchange rate data format."}
+
+        cleaned = {}
+        for k, v in inner.items():
+            clean_key = re.sub(r"^\d+\.\s*", "", k).strip().lower().replace(" ", "_")
+            cleaned[clean_key] = _safe_float(v) if v is not None and re.search(r"[\d.]", str(v)) else v
+
+        df = pd.DataFrame([cleaned])
+        return {"currency_exchange": df}
+
+    # ── Polygon transformers ───────────────────────────────────
+
+    def _transform_polygon_open_close(self, data):
+        records = data.get("polygon_open_close")
+        if not records:
+            return {"error": "No open-close data found in Polygon response"}
+
+        df = pd.DataFrame(records)
+        df.rename(columns={
+            "date": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }, inplace=True)
+
+        numeric_cols = ["Open", "High", "Low", "Close"]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
+
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date", ascending=True).reset_index(drop=True)
+
+        df["Return"] = df["Close"].pct_change()
+        df["Volatility"] = df["Return"].rolling(20).std()
+
+        meta = {}
+        if "_total_dates" in data:
+            meta["total_dates"] = data["_total_dates"]
+        if "_fetched" in data:
+            meta["fetched"] = data["_fetched"]
+
+        result = {"time_series_daily": df}
+        if meta:
+            result["_meta"] = meta
+        return result
+
+    def _transform_polygon_news(self, data):
+        raw = data.get("polygon_news")
+        if raw is None:
+            return {"error": "No news data found in Polygon response"}
+
+        articles = raw if isinstance(raw, list) else raw.get("results", [raw] if isinstance(raw, dict) else [])
+        if not articles:
+            return {"error": "No news articles found."}
+
+        SENTIMENT_MAP = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+        records = []
+        for article in articles:
+            published = article.get("published_utc", "")
+            date_str = published[:10] if published else ""
+
+            insights = article.get("insights", []) or []
+            sentiment_score = None
+            for insight in (insights if isinstance(insights, list) else []):
+                numeric = SENTIMENT_MAP.get(insight.get("sentiment", "").lower())
+                if numeric is not None:
+                    sentiment_score = numeric
+                    break
+
+            publisher_raw = article.get("publisher")
+            source = ""
+            if isinstance(publisher_raw, dict):
+                source = publisher_raw.get("name", "")
+            elif isinstance(publisher_raw, str):
+                source = publisher_raw
+
+            records.append({
+                "Date": date_str,
+                "ticker_sentiment_score": sentiment_score,
+                "source": source,
+            })
+
+        df = pd.DataFrame(records)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        daily = df.groupby("Date").agg(
+            sentiment_score=("ticker_sentiment_score", "mean"),
+            sentiment_std=("ticker_sentiment_score", "std"),
+            article_count=("Date", "count"),
+        ).reset_index()
+        daily = daily.sort_values("Date").reset_index(drop=True)
+        return {"news_sentiment": daily}
+
+    def _transform_polygon_treasury_yields(self, data):
+        raw = data.get("polygon_treasury_yields")
+        if not raw:
+            return {"error": "No treasury yield data found in Polygon response"}
+
+        records = raw if isinstance(raw, list) else raw.get("results", [raw] if isinstance(raw, dict) else [])
+        if not records:
+            return {"error": "No treasury yield records found."}
+
+        def _get_first(record, *keys):
+            for key in keys:
+                val = record.get(key)
+                if val is not None and val != "" and val != "N/A":
+                    return val
+            return ""
+
+        parsed = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            date_val = _get_first(item, "date", "Date", "timestamp", "observation_date")
+            maturity_val = _get_first(item, "maturity", "Maturity", "term", "duration", "maturity_duration")
+            value_val = _safe_float(_get_first(item, "value", "Value", "yield", "Yield", "close", "rate", "Rate", "percent"))
+            if not date_val:
+                continue
+            parsed.append({"Date": date_val, "maturity": maturity_val, "Value": value_val})
+
+        if not parsed:
+            sample_keys = str(list(records[0].keys())) if records else "no records"
+            return {"error": f"Could not parse treasury yield records. Sample record keys: {sample_keys}"}
+
+        df = pd.DataFrame(parsed)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+
+        result = {}
+        result["all_yields"] = df
+
+        df["_mat_clean"] = df["maturity"].str.lower().str.replace(r"[-\s]", "", regex=True)
+        df_3m = df[df["_mat_clean"].str.contains("3month|3m|3mo|^3$", na=False)].copy()
+        if not df_3m.empty:
+            result["treasury_yield_3month"] = df_3m[["Date", "Value"]].reset_index(drop=True)
+
+        df_10y = df[df["_mat_clean"].str.contains("10year|10y|10yr|^10$", na=False)].copy()
+        if not df_10y.empty:
+            result["treasury_yield_10year"] = df_10y[["Date", "Value"]].reset_index(drop=True)
+
+        if "treasury_yield_3month" not in result and "treasury_yield_10year" not in result:
+            if "maturity" in df.columns:
+                maturities = df["maturity"].unique()
+                if len(maturities) >= 2:
+                    sorted_mats = sorted(maturities)
+                    result["treasury_yield_3month"] = df[df["maturity"] == sorted_mats[0]][["Date", "Value"]].reset_index(drop=True)
+                    result["treasury_yield_10year"] = df[df["maturity"] == sorted_mats[-1]][["Date", "Value"]].reset_index(drop=True)
+                elif len(maturities) == 1:
+                    result["treasury_yield_10year"] = df[["Date", "Value"]].reset_index(drop=True)
+                    result["treasury_yield_3month"] = pd.DataFrame(columns=["Date", "Value"])
+
+        return result
+
+    def _transform_polygon_fx(self, data):
+        raw = data.get("polygon_fx")
+        if raw is None:
+            return {"error": "No FX data found in Polygon response"}
+
+        records = raw if isinstance(raw, list) else raw.get("results", [raw] if isinstance(raw, dict) else [])
+        if not records:
+            return {"error": "No FX data available for the selected date."}
+
+        parsed = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            parsed.append({
+                "Ticker": item.get("T", ""),
+                "Open": _safe_float(item.get("o")),
+                "High": _safe_float(item.get("h")),
+                "Low": _safe_float(item.get("l")),
+                "Close": _safe_float(item.get("c")),
+                "Volume": _safe_float(item.get("v")),
+                "Transactions": _safe_int(item.get("n")),
+            })
+
+        if not parsed:
+            return {"error": "Could not parse FX records."}
+
+        df = pd.DataFrame(parsed)
         return {"currency_exchange": df}
 
 

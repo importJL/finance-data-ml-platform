@@ -10,7 +10,7 @@ class DeliveryAgent:
     def to_csv(self, dataframes):
         result = {}
         for name, df in dataframes.items():
-            if hasattr(df, "empty") and df.empty:
+            if not hasattr(df, "to_csv") or (hasattr(df, "empty") and df.empty):
                 continue
             buf = io.BytesIO()
             df.to_csv(buf, index=False)
@@ -21,7 +21,7 @@ class DeliveryAgent:
     def to_json(self, dataframes):
         result = {}
         for name, df in dataframes.items():
-            if hasattr(df, "empty") and df.empty:
+            if not hasattr(df, "to_json") or (hasattr(df, "empty") and df.empty):
                 continue
             if isinstance(df, dict):
                 payload = df

@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+POLYGON_BASE_URL = "https://api.massive.com"
 
 if not API_KEY:
     raise RuntimeError(
