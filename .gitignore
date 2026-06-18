@@ -5,5 +5,7 @@ __pycache__/
 .streamlit/
 .opencode/
 models/
+data/
+scratch_pgms/
 AGENTS.md
 ML_PLAN.md

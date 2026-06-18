@@ -1,4 +1,6 @@
+import json
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -48,6 +50,161 @@ class FeatureEngine:
             result["gold_momentum_20d"] = result["gold_price"].pct_change(periods=20)
             result["gold_momentum_5d"] = result["gold_price"].pct_change(periods=5)
 
+        return result
+
+    def load_daily_prices(self, data_dir="data"):
+        data_path = Path(data_dir)
+        frames = []
+        for fpath in sorted(data_path.glob("*_daily.csv")):
+            ticker = fpath.stem.replace("_daily", "")
+            df = pd.read_csv(str(fpath))
+            required_cols = {"date", "open", "high", "low", "close", "volume"}
+            if not required_cols.issubset(df.columns):
+                _log.warning("Skipping %s: missing required columns", fpath)
+                continue
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df["ticker"] = ticker
+            df["close_pct_change"] = df["close"].pct_change()
+            df["hl_spread"] = df["high"] - df["low"]
+            df["hl_spread_pct_change"] = df["hl_spread"].pct_change()
+            df["volume_pct_change"] = df["volume"].pct_change()
+            next_open = df["open"].shift(-1)
+            df["open_next_close_prev_diff"] = next_open - df["close"]
+            df["open_next_close_prev_diff_pct"] = df["open_next_close_prev_diff"] / df["close"]
+            df["open_next_close_prev_diff_sign"] = np.sign(df["open_next_close_prev_diff"])
+            frames.append(df)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def load_news(self, data_dir="data"):
+        data_path = Path(data_dir)
+        main_records = []
+        topic_records = []
+        ts_records = []
+
+        for fpath in sorted(data_path.glob("*_news.json")):
+            ticker = fpath.stem.replace("_news", "")
+            with open(fpath, "r") as f:
+                articles = json.load(f)
+            for article in articles:
+                title = article.get("title", "")
+                time_published = article.get("time_published", "")
+                summary = article.get("summary", "")
+                overall_sentiment_score = article.get("overall_sentiment_score")
+                overall_sentiment_label = article.get("overall_sentiment_label", "")
+                topics = article.get("topics", [])
+
+                main_records.append({
+                    "ticker": ticker,
+                    "title": title,
+                    "time_published": time_published,
+                    "summary": summary,
+                    "topics": str([t["topic"] for t in topics]) if topics else "",
+                    "overall_sentiment_score": overall_sentiment_score,
+                    "overall_sentiment_label": overall_sentiment_label,
+                })
+
+                for t in topics:
+                    topic_records.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "time_published": time_published,
+                        "topic": t.get("topic", ""),
+                        "relevance_score": t.get("relevance_score", ""),
+                    })
+
+                for ts in article.get("ticker_sentiment", []):
+                    ts_records.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "time_published": time_published,
+                        "sentiment_ticker": ts.get("ticker", ""),
+                        "relevance_score": ts.get("relevance_score", ""),
+                        "ticker_sentiment_score": ts.get("ticker_sentiment_score", ""),
+                        "ticker_sentiment_label": ts.get("ticker_sentiment_label", ""),
+                    })
+
+        news_main = pd.DataFrame(main_records)
+        news_topics = pd.DataFrame(topic_records)
+        news_ticker_sentiment = pd.DataFrame(ts_records)
+        for _df in (news_main, news_topics, news_ticker_sentiment):
+            if not _df.empty:
+                _df["time_published"] = pd.to_datetime(
+                    _df["time_published"], format="%Y%m%dT%H%M%S", errors="coerce"
+                )
+        return {
+            "news_main": news_main,
+            "news_topics": news_topics,
+            "news_ticker_sentiment": news_ticker_sentiment,
+        }
+
+    def join_prices_with_sentiment(self, price_df, news_dict):
+        if price_df is None or price_df.empty:
+            return pd.DataFrame()
+
+        news_main = news_dict.get("news_main")
+        news_topics = news_dict.get("news_topics")
+        news_ticker_sentiment = news_dict.get("news_ticker_sentiment")
+
+        sentiment_frames = []
+
+        if news_ticker_sentiment is not None and not news_ticker_sentiment.empty:
+            ts = news_ticker_sentiment.copy()
+            ts["relevance_score"] = pd.to_numeric(ts["relevance_score"], errors="coerce")
+            ts["ticker_sentiment_score"] = pd.to_numeric(ts["ticker_sentiment_score"], errors="coerce")
+            ts["weighted_score"] = ts["relevance_score"] * ts["ticker_sentiment_score"]
+            ts["date"] = ts["time_published"].dt.normalize()
+            ts = ts.groupby(["ticker", "date"], as_index=False).agg(
+                sentiment_ticker_count=("sentiment_ticker", "count"),
+                avg_weighted_sentiment=("weighted_score", "mean"),
+            )
+            sentiment_frames.append(ts)
+
+        if news_topics is not None and not news_topics.empty:
+            tp = news_topics.copy()
+            tp["relevance_score"] = pd.to_numeric(tp["relevance_score"], errors="coerce").fillna(0.0)
+            tp["date"] = tp["time_published"].dt.normalize()
+            tp = tp.pivot_table(
+                index=["ticker", "date"],
+                columns="topic",
+                values="relevance_score",
+                fill_value=0.0,
+            ).reset_index()
+            tp.columns.name = None
+            sentiment_frames.append(tp)
+
+        if news_main is not None and not news_main.empty:
+            nm = news_main.copy()
+            nm["overall_sentiment_score"] = pd.to_numeric(nm["overall_sentiment_score"], errors="coerce")
+            nm["date"] = nm["time_published"].dt.normalize()
+            nm = nm.groupby(["ticker", "date"], as_index=False).agg(
+                avg_overall_sentiment_score=("overall_sentiment_score", "mean"),
+                article_count=("date", "count"),
+            )
+            sentiment_frames.append(nm)
+
+        if not sentiment_frames:
+            _log.warning("No sentiment data available — returning price_df copy")
+            return price_df.copy()
+
+        sentiment_df = sentiment_frames[0]
+        for sf in sentiment_frames[1:]:
+            sentiment_df = pd.merge(sentiment_df, sf, on=["ticker", "date"], how="outer")
+
+        price_key = price_df.copy()
+        price_key["date"] = price_key["date"].dt.normalize()
+
+        result = pd.merge(price_key, sentiment_df, on=["ticker", "date"], how="inner")
+        _log.info(
+            "Joined prices with sentiment: %d rows × %d columns",
+            result.shape[0], result.shape[1],
+        )
+        
+        result["final_sentiment_score"] = result[["avg_weighted_sentiment", "avg_overall_sentiment_score"]].mean(axis=1, skipna=True)
+        result.drop(["avg_weighted_sentiment", "avg_overall_sentiment_score"], axis=1, inplace=True)
         return result
 
     def build_all(self, price_df, sentiment_df=None, earnings_df=None,
